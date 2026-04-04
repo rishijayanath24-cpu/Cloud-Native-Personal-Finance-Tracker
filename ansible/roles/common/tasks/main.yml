@@ -1,0 +1,42 @@
+---
+- name: Install common packages
+  package:
+    name:
+      - curl
+      - wget
+      - git
+      - unzip
+      - tar
+      - jq
+      - htop
+      - vim
+    state: present
+
+- name: Set timezone to UTC
+  timezone:
+    name: UTC
+
+- name: Configure sysctl for Kubernetes
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+    - { key: 'net.ipv4.ip_forward', value: '1' }
+    - { key: 'vm.max_map_count', value: '262144' }
+
+- name: Load kernel modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - br_netfilter
+    - overlay
+
+- name: Ensure kernel modules persist on reboot
+  copy:
+    content: "br_netfilter\noverlay\n"
+    dest: /etc/modules-load.d/k8s.conf

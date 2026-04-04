@@ -1,0 +1,136 @@
+name: CD - Deploy to Kubernetes
+
+on:
+  workflow_run:
+    workflows: ["CI - Build and Test"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        default: 'latest'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: staging
+      url: https://staging.finance-tracker.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name finance-tracker-staging-eks
+
+      - name: Set image tag
+        id: image-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update Kubernetes deployments with new images
+        env:
+          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+        run: |
+          SERVICES=("api-gateway" "user-service" "transaction-service" "budget-service" "notification-service" "frontend")
+          for service in "${SERVICES[@]}"; do
+            kubectl set image deployment/${service} ${service}=${ECR_REGISTRY}/finance-tracker/${service}:${IMAGE_TAG} \
+              -n finance-tracker --record || true
+          done
+
+      - name: Wait for rollout completion
+        run: |
+          SERVICES=("api-gateway" "user-service" "transaction-service" "budget-service" "notification-service" "frontend")
+          for service in "${SERVICES[@]}"; do
+            kubectl rollout status deployment/${service} -n finance-tracker --timeout=300s
+          done
+
+      - name: Run smoke tests
+        run: |
+          GATEWAY_URL=$(kubectl get service api-gateway -n finance-tracker -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -n "$GATEWAY_URL" ]; then
+            curl -f http://${GATEWAY_URL}/health || exit 1
+            echo "Smoke test passed!"
+          else
+            echo "LoadBalancer not ready, checking ClusterIP..."
+            kubectl get pods -n finance-tracker
+          fi
+
+      - name: Notify deployment success
+        if: success()
+        run: echo "Staging deployment successful! Tag: ${{ steps.image-tag.outputs.tag }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed! Rolling back..."
+          SERVICES=("api-gateway" "user-service" "transaction-service" "budget-service" "notification-service" "frontend")
+          for service in "${SERVICES[@]}"; do
+            kubectl rollout undo deployment/${service} -n finance-tracker || true
+          done
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.event.inputs.environment == 'production' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    environment:
+      name: production
+      url: https://finance-tracker.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for production
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name finance-tracker-prod-eks
+
+      - name: Deploy to production with zero-downtime
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+        run: |
+          SERVICES=("api-gateway" "user-service" "transaction-service" "budget-service" "notification-service" "frontend")
+          for service in "${SERVICES[@]}"; do
+            kubectl set image deployment/${service} ${service}=${ECR_REGISTRY}/finance-tracker/${service}:sha-$(echo $IMAGE_TAG | cut -c1-7) \
+              -n finance-tracker
+            kubectl rollout status deployment/${service} -n finance-tracker --timeout=300s
+          done
+
+      - name: Verify production health
+        run: |
+          kubectl get pods -n finance-tracker
+          kubectl get hpa -n finance-tracker

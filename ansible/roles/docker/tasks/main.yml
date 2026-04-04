@@ -1,0 +1,56 @@
+---
+- name: Install Docker dependencies
+  package:
+    name:
+      - yum-utils
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Add Docker repository (RedHat)
+  get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+  when: ansible_os_family == "RedHat"
+
+- name: Install Docker CE
+  package:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+
+- name: Start and enable Docker
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Add user to docker group
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+
+- name: Configure Docker daemon
+  copy:
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "100m",
+          "max-file": "3"
+        },
+        "storage-driver": "overlay2",
+        "exec-opts": ["native.cgroupdriver=systemd"]
+      }
+    dest: /etc/docker/daemon.json
+  notify: restart docker
+
+- name: Create Docker daemon directory
+  file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'

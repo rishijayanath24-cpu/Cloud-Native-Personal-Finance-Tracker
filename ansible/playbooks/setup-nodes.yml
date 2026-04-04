@@ -1,0 +1,43 @@
+---
+- name: Configure EKS Worker Nodes
+  hosts: k8s_nodes
+  become: true
+  vars:
+    docker_version: "24.0"
+    kubectl_version: "1.28.0"
+    node_exporter_version: "1.7.0"
+
+  pre_tasks:
+    - name: Update package cache
+      dnf:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+  roles:
+    - common
+    - docker
+    - kubectl
+    - node-exporter
+    - security-hardening
+
+  post_tasks:
+    - name: Verify Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Run Docker health check
+      command: docker info
+      register: docker_info
+      changed_when: false
+
+    - name: Display Docker version
+      debug:
+        msg: "Docker is running: {{ docker_info.stdout_lines[0] }}"

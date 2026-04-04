@@ -1,0 +1,93 @@
+---
+- name: Deploy Finance Tracker to Kubernetes
+  hosts: localhost
+  connection: local
+  vars:
+    kubeconfig_path: "~/.kube/config"
+    namespace: finance-tracker
+    image_tag: "{{ lookup('env', 'IMAGE_TAG') | default('latest', true) }}"
+    ecr_registry: "{{ lookup('env', 'ECR_REGISTRY') }}"
+
+  tasks:
+    - name: Check kubectl connectivity
+      command: kubectl cluster-info
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: cluster_info
+      changed_when: false
+
+    - name: Create finance-tracker namespace
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/namespace.yaml"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Apply ConfigMaps
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/configmaps/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Apply Secrets
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/secrets/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Deploy PostgreSQL databases
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/postgres/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Deploy Redis
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/redis/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Wait for databases to be ready
+      command: >
+        kubectl rollout status statefulset/{{ item }}
+        -n {{ namespace }} --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      loop:
+        - postgres-user
+        - postgres-transaction
+        - postgres-budget
+
+    - name: Deploy microservices
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/deployments/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Wait for deployments to be ready
+      command: >
+        kubectl rollout status deployment/{{ item }}
+        -n {{ namespace }} --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      loop:
+        - user-service
+        - transaction-service
+        - budget-service
+        - notification-service
+        - api-gateway
+        - frontend
+
+    - name: Apply Ingress rules
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/ingress/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Deploy monitoring stack
+      command: kubectl apply -f "{{ playbook_dir }}/../../k8s/monitoring/"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Get service endpoints
+      command: kubectl get services -n {{ namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: services_output
+      changed_when: false
+
+    - name: Display services
+      debug:
+        msg: "{{ services_output.stdout_lines }}"

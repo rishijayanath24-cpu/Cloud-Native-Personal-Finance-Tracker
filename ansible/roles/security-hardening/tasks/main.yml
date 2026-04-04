@@ -1,0 +1,36 @@
+---
+- name: Disable root SSH login
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PermitRootLogin'
+    line: 'PermitRootLogin no'
+  notify: restart sshd
+
+- name: Disable password authentication
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+  notify: restart sshd
+
+- name: Configure UFW firewall rules (Ubuntu)
+  block:
+    - ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["22", "80", "443", "6443", "2379", "2380", "10250", "10251", "10252"]
+    - ufw:
+        state: enabled
+        policy: deny
+  when: ansible_os_family == "Debian"
+
+- name: Set file permissions on sensitive files
+  file:
+    path: "{{ item }}"
+    mode: '0600'
+    owner: root
+    group: root
+  loop:
+    - /etc/ssh/sshd_config
+  ignore_errors: true

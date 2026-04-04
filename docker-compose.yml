@@ -1,0 +1,296 @@
+version: '3.8'
+
+services:
+  # Databases
+  postgres-user:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: userdb
+      POSTGRES_USER: financeuser
+      POSTGRES_PASSWORD: securepassword123
+    volumes:
+      - postgres-user-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U financeuser -d userdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finance-network
+
+  postgres-transaction:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: transactiondb
+      POSTGRES_USER: financeuser
+      POSTGRES_PASSWORD: securepassword123
+    volumes:
+      - postgres-transaction-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U financeuser -d transactiondb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finance-network
+
+  postgres-budget:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: budgetdb
+      POSTGRES_USER: financeuser
+      POSTGRES_PASSWORD: securepassword123
+    volumes:
+      - postgres-budget-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U financeuser -d budgetdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finance-network
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finance-network
+
+  # Microservices
+  user-service:
+    build:
+      context: services/user-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://financeuser:securepassword123@postgres-user:5432/userdb
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres-user:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  transaction-service:
+    build:
+      context: services/transaction-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://financeuser:securepassword123@postgres-transaction:5432/transactiondb
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+      USER_SERVICE_URL: http://user-service:8001
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres-transaction:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  budget-service:
+    build:
+      context: services/budget-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://financeuser:securepassword123@postgres-budget:5432/budgetdb
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+      TRANSACTION_SERVICE_URL: http://transaction-service:8002
+      NOTIFICATION_SERVICE_URL: http://notification-service:8004
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres-budget:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: services/notification-service
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: "587"
+      SMTP_USER: ""
+      SMTP_PASSWORD: ""
+      FROM_EMAIL: noreply@financetracker.com
+    ports:
+      - "8004:8004"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  analytics-service:
+    build:
+      context: services/analytics-service
+      dockerfile: Dockerfile
+    environment:
+      SECRET_KEY: dev-secret-key-change-in-production
+      ALGORITHM: HS256
+      TRANSACTION_SERVICE_URL: http://transaction-service:8002
+      BUDGET_SERVICE_URL: http://budget-service:8003
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: "60"
+    ports:
+      - "8005:8005"
+    depends_on:
+      transaction-service:
+        condition: service_healthy
+      budget-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: services/api-gateway
+      dockerfile: Dockerfile
+    environment:
+      PORT: "3000"
+      USER_SERVICE_URL: http://user-service:8001
+      TRANSACTION_SERVICE_URL: http://transaction-service:8002
+      BUDGET_SERVICE_URL: http://budget-service:8003
+      NOTIFICATION_SERVICE_URL: http://notification-service:8004
+      ANALYTICS_SERVICE_URL: http://analytics-service:8005
+      ALLOWED_ORIGINS: "http://localhost:5173,http://localhost:80"
+    ports:
+      - "9091:3000"
+    depends_on:
+      user-service:
+        condition: service_healthy
+      transaction-service:
+        condition: service_healthy
+      budget-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      analytics-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: services/frontend
+      dockerfile: Dockerfile
+    ports:
+      - "4567:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  # Monitoring
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./k8s/monitoring/prometheus-config.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SERVER_HTTP_PORT: 3001
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3001"
+    depends_on:
+      - prometheus
+    networks:
+      - finance-network
+    restart: unless-stopped
+
+volumes:
+  postgres-user-data:
+  postgres-transaction-data:
+  postgres-budget-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  finance-network:
+    driver: bridge

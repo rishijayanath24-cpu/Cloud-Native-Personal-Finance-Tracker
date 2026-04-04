@@ -1,0 +1,60 @@
+---
+- name: Health Check All Services
+  hosts: localhost
+  connection: local
+  vars:
+    namespace: finance-tracker
+    services:
+      - name: user-service
+        port: 8001
+      - name: transaction-service
+        port: 8002
+      - name: budget-service
+        port: 8003
+      - name: notification-service
+        port: 8004
+      - name: api-gateway
+        port: 3000
+
+  tasks:
+    - name: Check pod status for all deployments
+      command: kubectl get pods -n {{ namespace }} -o wide
+      register: pod_status
+      changed_when: false
+
+    - name: Display pod status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+
+    - name: Check for unhealthy pods
+      command: >
+        kubectl get pods -n {{ namespace }}
+        --field-selector=status.phase!=Running
+        -o jsonpath='{.items[*].metadata.name}'
+      register: unhealthy_pods
+      changed_when: false
+
+    - name: Alert on unhealthy pods
+      debug:
+        msg: "WARNING: Unhealthy pods detected: {{ unhealthy_pods.stdout }}"
+      when: unhealthy_pods.stdout | length > 0
+
+    - name: Check HPA status
+      command: kubectl get hpa -n {{ namespace }}
+      register: hpa_status
+      changed_when: false
+
+    - name: Display HPA status
+      debug:
+        msg: "{{ hpa_status.stdout_lines }}"
+
+    - name: Check resource usage
+      command: kubectl top pods -n {{ namespace }}
+      register: resource_usage
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display resource usage
+      debug:
+        msg: "{{ resource_usage.stdout_lines }}"
+      when: resource_usage.rc == 0
