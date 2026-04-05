@@ -55,7 +55,7 @@ override.tf.json
 .LSOverride
 
 # Kubernetes secrets (never commit real secrets)
-k8s/secrets/app-secrets.yaml
+# k8s/secrets/app-secrets.yaml  # committed with placeholder values only
 
 # Logs
 *.log
