@@ -50,6 +50,11 @@ jobs:
           resource-group: finance-tracker-rg
           cluster-name: finance-tracker-aks
 
+      - name: Clean previous deployment (fix immutable errors)
+        run: |
+          kubectl delete namespace finance-tracker --ignore-not-found
+          sleep 20
+      
       - name: Apply namespace and config
         run: |
           kubectl apply -f k8s/namespace.yaml
