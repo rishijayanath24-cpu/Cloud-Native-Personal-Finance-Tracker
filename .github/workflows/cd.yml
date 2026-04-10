@@ -1,74 +1,72 @@
 name: CD - Deploy to Kubernetes
 
 on:
-workflow_run:
-workflows: ["CI - Build and Test"]
-types: [completed]
-branches: [master, main]
+  workflow_run:
+    workflows: ["CI - Build and Test"]
+    types: [completed]
+    branches: [master, main]
 
-workflow_dispatch:
-inputs:
-image_tag:
-description: 'Image tag to deploy (default: latest)'
-required: false
-default: 'latest'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: latest)'
+        required: false
+        default: 'latest'
 
 jobs:
-deploy:
-name: Deploy to Kubernetes
-runs-on: ubuntu-latest
-if: >
-github.event_name == 'workflow_dispatch' ||
-github.event.workflow_run.conclusion == 'success'
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
 
-```
-steps:
-  - uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
 
-  - name: Set image tag
-    id: tag
-    run: |
-      if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-        echo "value=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
-      else
-        echo "value=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
-      fi
+      - name: Set image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+          fi
 
-  - name: Set up kubectl
-    uses: azure/setup-kubectl@v3
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
 
-  - name: Azure Login
-    uses: azure/login@v2
-    with:
-      creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-  - name: Set AKS context
-    uses: azure/aks-set-context@v3
-    with:
-      resource-group: finance-tracker-rg
-      cluster-name: finance-tracker-aks
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: finance-tracker-rg
+          cluster-name: finance-tracker-aks
 
-  - name: Deploy to Kubernetes (clean)
-    env:
-      HUB: ${{ secrets.DOCKERHUB_USERNAME }}
-      TAG: ${{ steps.tag.outputs.value }}
-    run: |
-      echo "Cleaning old deployment..."
-      kubectl delete namespace finance-tracker --ignore-not-found
-      sleep 30
+      - name: Deploy to Kubernetes (clean)
+        env:
+          HUB: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          echo "Cleaning old deployment..."
+          kubectl delete namespace finance-tracker --ignore-not-found
+          sleep 30
 
-      echo "Deploying fresh resources..."
-      kubectl apply -k k8s/
+          echo "Deploying fresh resources..."
+          kubectl apply -k k8s/
 
-      echo "Updating images..."
-      for svc in user-service transaction-service budget-service notification-service analytics-service api-gateway frontend; do
-        kubectl set image deployment/${svc} ${svc}=${HUB}/finance-tracker-${svc}:${TAG} \
-          -n finance-tracker || true
-      done
+          echo "Updating images..."
+          for svc in user-service transaction-service budget-service notification-service analytics-service api-gateway frontend; do
+            kubectl set image deployment/${svc} ${svc}=${HUB}/finance-tracker-${svc}:${TAG} \
+              -n finance-tracker || true
+          done
 
-      echo "Final pod status:"
-      kubectl get pods -n finance-tracker || echo "Deploy completed"
+          echo "Final pod status:"
+          kubectl get pods -n finance-tracker || echo "Deploy completed"
 
-  - name: Done
-    run: echo "Deployment completed successfully"
-```
+      - name: Done
+        run: echo "Deployment completed successfully"
