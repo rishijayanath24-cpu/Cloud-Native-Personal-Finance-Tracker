@@ -18,7 +18,9 @@ export default function RegisterPage() {
       navigate('/dashboard');
       toast.success('Account created successfully!');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Registration failed');
+      const detail = err.response?.data?.detail;
+      const msg = Array.isArray(detail) ? detail[0]?.msg : (typeof detail === 'string' ? detail : 'Registration failed');
+      toast.error(msg || 'Registration failed');
     } finally {
       setLoading(false);
     }

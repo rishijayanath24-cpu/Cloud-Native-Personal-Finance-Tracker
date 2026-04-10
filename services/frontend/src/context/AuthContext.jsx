@@ -24,10 +24,7 @@ export function AuthProvider({ children }) {
   }, []);
 
   const login = async (username, password) => {
-    const formData = new FormData();
-    formData.append('username', username);
-    formData.append('password', password);
-    const res = await api.post('/api/users/login', formData);
+    const res = await api.post('/api/users/login', { username, password });
     const { access_token } = res.data;
     localStorage.setItem('token', access_token);
     api.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;

@@ -1,13 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
 from app import crud, schemas
 from app.auth import create_access_token, decode_token
 from app.database import get_db
 from app.config import settings
 from app.models import User
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/users/login")
@@ -35,8 +40,8 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     return crud.create_user(db, user)
 
 @router.post("/login", response_model=schemas.Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = crud.authenticate_user(db, form_data.username, form_data.password)
+def login(login_data: LoginRequest, db: Session = Depends(get_db)):
+    user = crud.authenticate_user(db, login_data.username, login_data.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
     access_token = create_access_token(

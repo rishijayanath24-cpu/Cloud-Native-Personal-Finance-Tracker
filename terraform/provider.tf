@@ -2,9 +2,9 @@ terraform {
   required_version = ">= 1.6.0"
 
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
@@ -16,47 +16,28 @@ terraform {
     }
   }
 
-  backend "s3" {
-    bucket         = "finance-tracker-terraform-state"
-    key            = "prod/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "terraform-state-lock"
+  backend "local" {
+    path = "terraform.tfstate"
   }
 }
 
-provider "aws" {
-  region = var.aws_region
-
-  default_tags {
-    tags = {
-      Project     = "finance-tracker"
-      Environment = var.environment
-      ManagedBy   = "terraform"
-    }
-  }
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
 }
 
 provider "kubernetes" {
-  host                   = module.eks.cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks.cluster_ca_certificate)
-
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
-    command     = "aws"
-  }
+  host                   = azurerm_kubernetes_cluster.main.kube_config[0].host
+  client_certificate     = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].client_certificate)
+  client_key             = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].client_key)
+  cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].cluster_ca_certificate)
 }
 
 provider "helm" {
   kubernetes {
-    host                   = module.eks.cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks.cluster_ca_certificate)
-
-    exec {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
-      command     = "aws"
-    }
+    host                   = azurerm_kubernetes_cluster.main.kube_config[0].host
+    client_certificate     = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].client_certificate)
+    client_key             = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].client_key)
+    cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].cluster_ca_certificate)
   }
 }

@@ -1,60 +1,64 @@
-locals {
-  availability_zones = slice(data.aws_availability_zones.available.names, 0, 3)
-  cluster_name       = "${var.project_name}-${var.environment}-eks"
+# Resource Group
+resource "azurerm_resource_group" "main" {
+  name     = var.resource_group_name
+  location = var.location
 
-  common_tags = {
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# Virtual Network
+resource "azurerm_virtual_network" "main" {
+  name                = "${var.project_name}-vnet"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+
+  tags = {
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-data "aws_availability_zones" "available" {
-  state = "available"
+# AKS Subnet
+resource "azurerm_subnet" "aks" {
+  name                 = "aks-subnet"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = ["10.0.1.0/24"]
 }
 
-# VPC
-module "vpc" {
-  source = "./modules/vpc"
+# AKS Cluster
+resource "azurerm_kubernetes_cluster" "main" {
+  name                = "${var.project_name}-aks"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  dns_prefix = var.project_name
+  sku_tier   = "Standard"
 
-  project_name         = var.project_name
-  environment          = var.environment
-  vpc_cidr             = var.vpc_cidr
-  private_subnet_cidrs = var.private_subnet_cidrs
-  public_subnet_cidrs  = var.public_subnet_cidrs
-  availability_zones   = local.availability_zones
-  cluster_name         = local.cluster_name
-}
+  default_node_pool {
+    name           = "default"
+    node_count     = var.node_count
+    vm_size        = var.node_vm_size
+    vnet_subnet_id = azurerm_subnet.aks.id
+  }
 
-# EKS Cluster
-module "eks" {
-  source = "./modules/eks"
+  identity {
+    type = "SystemAssigned"
+  }
 
-  cluster_name        = local.cluster_name
-  cluster_version     = var.eks_cluster_version
-  vpc_id              = module.vpc.vpc_id
-  private_subnet_ids  = module.vpc.private_subnet_ids
-  node_instance_types = var.eks_node_instance_types
-  node_desired_size   = var.eks_node_desired_size
-  node_min_size       = var.eks_node_min_size
-  node_max_size       = var.eks_node_max_size
-  environment         = var.environment
-}
+  network_profile {
+    network_plugin    = "kubenet"
+    load_balancer_sku = "standard"
+  }
 
-# ECR Repositories
-module "ecr" {
-  source = "./modules/ecr"
-
-  project_name         = var.project_name
-  environment          = var.environment
-  image_tag_mutability = var.ecr_image_tag_mutability
-  services = [
-    "api-gateway",
-    "user-service",
-    "transaction-service",
-    "budget-service",
-    "notification-service",
-    "frontend"
-  ]
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+  }
 }
 
 # NGINX Ingress Controller
@@ -75,7 +79,7 @@ resource "helm_release" "nginx_ingress" {
     value = "true"
   }
 
-  depends_on = [module.eks]
+  depends_on = [azurerm_kubernetes_cluster.main]
 }
 
 # Cert-Manager
@@ -92,7 +96,7 @@ resource "helm_release" "cert_manager" {
     value = "true"
   }
 
-  depends_on = [module.eks]
+  depends_on = [azurerm_kubernetes_cluster.main]
 }
 
 # Kubernetes Namespace
@@ -105,19 +109,5 @@ resource "kubernetes_namespace" "finance_tracker" {
     }
   }
 
-  depends_on = [module.eks]
-}
-
-# S3 bucket for Terraform state lock table
-resource "aws_dynamodb_table" "terraform_state_lock" {
-  name         = "terraform-state-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  tags = local.common_tags
+  depends_on = [azurerm_kubernetes_cluster.main]
 }
