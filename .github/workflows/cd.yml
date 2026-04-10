@@ -53,7 +53,8 @@ jobs:
       - name: Clean previous deployment (fix immutable errors)
         run: |
           kubectl delete namespace finance-tracker --ignore-not-found
-          sleep 20
+          echo "Waiting for namespace deletion..."
+          sleep 60
       
       - name: Apply namespace and config
         run: |
