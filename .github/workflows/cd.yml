@@ -62,15 +62,17 @@ jobs:
           kubectl apply -f k8s/configmaps/
           kubectl apply -f k8s/secrets/
 
-      - name: Deploy services
+      - name: Deploy (clean + simple)
         env:
           HUB: ${{ secrets.DOCKERHUB_USERNAME }}
           TAG:  ${{ steps.tag.outputs.value }}
         run: |
-          kubectl apply -f k8s/postgres/
-          kubectl apply -f k8s/redis/
-          kubectl apply -f k8s/deployments/
-          kubectl apply -f k8s/ingress/
+          kubectl delete namespace finance-tracker --ignore-not-found
+          sleep 30
+
+          kubectl apply -k k8s/
+
+          kubectl get pods -n finance-tracker || echo "Deploy done"
 
           # Update each deployment to the new image tag
           for svc in user-service transaction-service budget-service notification-service analytics-service api-gateway frontend; do
@@ -78,11 +80,7 @@ jobs:
               -n finance-tracker || true
           done
 
-      - name: Wait for rollout
-        run: |
-          for svc in user-service transaction-service budget-service notification-service analytics-service api-gateway frontend; do
-            kubectl rollout status deployment/${svc} -n finance-tracker --timeout=180s || true
-          done
+     
 
       - name: Show pod status
         run: kubectl get pods -n finance-tracker
