@@ -9,7 +9,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: standard
+  storageClassName: managed-csi
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -35,6 +35,8 @@ spec:
           ports:
             - containerPort: 5432
           env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_DB
               value: budgetdb
             - name: POSTGRES_USER

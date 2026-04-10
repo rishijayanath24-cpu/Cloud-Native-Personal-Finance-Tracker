@@ -21,7 +21,6 @@ resources:
   - monitoring/prometheus-config.yaml
   - monitoring/prometheus.yaml
   - monitoring/grafana.yaml
-  - network-policies/network-policy.yaml
 
 commonLabels:
   project: finance-tracker

@@ -7,7 +7,7 @@ metadata:
     app: budget-service
     version: v1
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: budget-service
@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: budget-service
-          image: finance-tracker/budget-service:latest
+          image: rishi636363/finance-tracker-budget-service:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8003

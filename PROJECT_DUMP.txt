@@ -1,0 +1,2325 @@
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/.env.example**
+```
+DATABASE_URL=postgresql://postgres:password@localhost:5432/transactiondb
+SECRET_KEY=your-super-secret-key-change-in-production
+ALGORITHM=HS256
+USER_SERVICE_URL=http://localhost:8001
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/config.py**
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "postgresql://postgres:password@postgres-transaction:5432/transactiondb"
+    SECRET_KEY: str = "your-secret-key-change-in-production"
+    ALGORITHM: str = "HS256"
+    USER_SERVICE_URL: str = "http://user-service:8001"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/database.py**
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from app.config import settings
+
+engine = create_engine(settings.DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/models.py**
+```python
+from sqlalchemy import Column, Integer, String, Float, DateTime, Enum, func
+from sqlalchemy import ForeignKey
+import enum
+from app.database import Base
+
+class TransactionType(str, enum.Enum):
+    INCOME = "income"
+    EXPENSE = "expense"
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    transaction_type = Column(Enum(TransactionType), nullable=False)
+    category = Column(String(100), nullable=False)
+    description = Column(String(500))
+    date = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    tags = Column(String(500))
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/schemas.py**
+```python
+from pydantic import BaseModel, field_validator
+from datetime import datetime
+from typing import Optional, List
+from app.models import TransactionType
+
+class TransactionBase(BaseModel):
+    amount: float
+    transaction_type: TransactionType
+    category: str
+    description: Optional[str] = None
+    tags: Optional[str] = None
+
+    @field_validator('amount')
+    @classmethod
+    def amount_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Amount must be positive')
+        return v
+
+class TransactionCreate(TransactionBase):
+    date: Optional[datetime] = None
+
+class TransactionUpdate(BaseModel):
+    amount: Optional[float] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[str] = None
+
+class TransactionResponse(TransactionBase):
+    id: int
+    user_id: int
+    date: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class TransactionSummary(BaseModel):
+    total_income: float
+    total_expenses: float
+    net_balance: float
+    transaction_count: int
+    categories: dict
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/crud.py**
+```python
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional, List
+from datetime import datetime
+from app.models import Transaction, TransactionType
+from app.schemas import TransactionCreate, TransactionUpdate, TransactionSummary
+
+def get_transaction(db: Session, transaction_id: int, user_id: int) -> Optional[Transaction]:
+    return db.query(Transaction).filter(
+        Transaction.id == transaction_id,
+        Transaction.user_id == user_id
+    ).first()
+
+def get_transactions(db: Session, user_id: int, skip: int = 0, limit: int = 100,
+                     transaction_type: Optional[TransactionType] = None,
+                     category: Optional[str] = None,
+                     start_date: Optional[datetime] = None,
+                     end_date: Optional[datetime] = None) -> List[Transaction]:
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if transaction_type:
+        query = query.filter(Transaction.transaction_type == transaction_type)
+    if category:
+        query = query.filter(Transaction.category == category)
+    if start_date:
+        query = query.filter(Transaction.date >= start_date)
+    if end_date:
+        query = query.filter(Transaction.date <= end_date)
+    return query.order_by(Transaction.date.desc()).offset(skip).limit(limit).all()
+
+def create_transaction(db: Session, transaction: TransactionCreate, user_id: int) -> Transaction:
+    db_transaction = Transaction(**transaction.model_dump(), user_id=user_id)
+    db.add(db_transaction)
+    db.commit()
+    db.refresh(db_transaction)
+    return db_transaction
+
+def update_transaction(db: Session, transaction_id: int, user_id: int, transaction_update: TransactionUpdate) -> Optional[Transaction]:
+    db_transaction = get_transaction(db, transaction_id, user_id)
+    if not db_transaction:
+        return None
+    update_data = transaction_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_transaction, field, value)
+    db.commit()
+    db.refresh(db_transaction)
+    return db_transaction
+
+def delete_transaction(db: Session, transaction_id: int, user_id: int) -> bool:
+    db_transaction = get_transaction(db, transaction_id, user_id)
+    if not db_transaction:
+        return False
+    db.delete(db_transaction)
+    db.commit()
+    return True
+
+def get_summary(db: Session, user_id: int, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> TransactionSummary:
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if start_date:
+        query = query.filter(Transaction.date >= start_date)
+    if end_date:
+        query = query.filter(Transaction.date <= end_date)
+
+    transactions = query.all()
+    total_income = sum(t.amount for t in transactions if t.transaction_type == TransactionType.INCOME)
+    total_expenses = sum(t.amount for t in transactions if t.transaction_type == TransactionType.EXPENSE)
+
+    categories = {}
+    for t in transactions:
+        if t.category not in categories:
+            categories[t.category] = 0
+        categories[t.category] += t.amount
+
+    return TransactionSummary(
+        total_income=total_income,
+        total_expenses=total_expenses,
+        net_balance=total_income - total_expenses,
+        transaction_count=len(transactions),
+        categories=categories
+    )
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/main.py**
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from app.database import engine, Base
+from app.routers import transactions
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="Transaction Service",
+    description="Manages financial transactions - income and expenses",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Instrumentator().instrument(app).expose(app)
+app.include_router(transactions.router, prefix="/api/transactions", tags=["transactions"])
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "transaction-service"}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/transaction-service/app/routers/transactions.py**
+```python
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from datetime import datetime
+from app import crud, schemas
+from app.database import get_db
+from app.models import TransactionType
+from jose import jwt, JWTError
+from app.config import settings
+
+router = APIRouter()
+
+def get_current_user_id(authorization: Optional[str] = Header(None)) -> int:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        return int(user_id)
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+@router.post("/", response_model=schemas.TransactionResponse, status_code=status.HTTP_201_CREATED)
+def create_transaction(transaction: schemas.TransactionCreate, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    return crud.create_transaction(db, transaction, user_id)
+
+@router.get("/", response_model=List[schemas.TransactionResponse])
+def list_transactions(
+    skip: int = 0, limit: int = 100,
+    transaction_type: Optional[TransactionType] = None,
+    category: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    return crud.get_transactions(db, user_id, skip, limit, transaction_type, category, start_date, end_date)
+
+@router.get("/summary", response_model=schemas.TransactionSummary)
+def get_summary(
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    return crud.get_summary(db, user_id, start_date, end_date)
+
+@router.get("/{transaction_id}", response_model=schemas.TransactionResponse)
+def get_transaction(transaction_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    transaction = crud.get_transaction(db, transaction_id, user_id)
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return transaction
+
+@router.put("/{transaction_id}", response_model=schemas.TransactionResponse)
+def update_transaction(transaction_id: int, transaction_update: schemas.TransactionUpdate, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    transaction = crud.update_transaction(db, transaction_id, user_id, transaction_update)
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return transaction
+
+@router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_transaction(transaction_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    if not crud.delete_transaction(db, transaction_id, user_id):
+        raise HTTPException(status_code=404, detail="Transaction not found")
+```
+
+**Budget Service**
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/requirements.txt**
+```
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9
+python-jose[cryptography]==3.3.0
+pydantic==2.4.2
+pydantic-settings==2.0.3
+httpx==0.25.1
+prometheus-fastapi-instrumentator==6.1.0
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+
+EXPOSE 8003
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003"]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/.env.example**
+```
+DATABASE_URL=postgresql://postgres:password@localhost:5432/budgetdb
+SECRET_KEY=your-super-secret-key-change-in-production
+ALGORITHM=HS256
+TRANSACTION_SERVICE_URL=http://localhost:8002
+NOTIFICATION_SERVICE_URL=http://localhost:8004
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/config.py**
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "postgresql://postgres:password@postgres-budget:5432/budgetdb"
+    SECRET_KEY: str = "your-secret-key-change-in-production"
+    ALGORITHM: str = "HS256"
+    TRANSACTION_SERVICE_URL: str = "http://transaction-service:8002"
+    NOTIFICATION_SERVICE_URL: str = "http://notification-service:8004"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/models.py**
+```python
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, func, Enum
+import enum
+from app.database import Base
+
+class BudgetPeriod(str, enum.Enum):
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
+class Budget(Base):
+    __tablename__ = "budgets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    category = Column(String(100), nullable=False)
+    limit_amount = Column(Float, nullable=False)
+    spent_amount = Column(Float, default=0.0)
+    period = Column(Enum(BudgetPeriod), default=BudgetPeriod.MONTHLY)
+    is_active = Column(Boolean, default=True)
+    alert_threshold = Column(Float, default=80.0)  # percentage
+    start_date = Column(DateTime(timezone=True))
+    end_date = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/schemas.py**
+```python
+from pydantic import BaseModel, field_validator
+from datetime import datetime
+from typing import Optional
+from app.models import BudgetPeriod
+
+class BudgetBase(BaseModel):
+    name: str
+    category: str
+    limit_amount: float
+    period: BudgetPeriod = BudgetPeriod.MONTHLY
+    alert_threshold: float = 80.0
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+
+    @field_validator('limit_amount')
+    @classmethod
+    def limit_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Limit amount must be positive')
+        return v
+
+class BudgetCreate(BudgetBase):
+    pass
+
+class BudgetUpdate(BaseModel):
+    name: Optional[str] = None
+    limit_amount: Optional[float] = None
+    alert_threshold: Optional[float] = None
+    is_active: Optional[bool] = None
+
+class BudgetResponse(BudgetBase):
+    id: int
+    user_id: int
+    spent_amount: float
+    is_active: bool
+    created_at: datetime
+    usage_percentage: float = 0.0
+
+    class Config:
+        from_attributes = True
+
+    @property
+    def usage_percentage(self) -> float:
+        if self.limit_amount == 0:
+            return 0.0
+        return (self.spent_amount / self.limit_amount) * 100
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/database.py**
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from app.config import settings
+
+engine = create_engine(settings.DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/crud.py**
+```python
+from sqlalchemy.orm import Session
+from typing import Optional, List
+from app.models import Budget
+from app.schemas import BudgetCreate, BudgetUpdate
+
+def get_budget(db: Session, budget_id: int, user_id: int) -> Optional[Budget]:
+    return db.query(Budget).filter(Budget.id == budget_id, Budget.user_id == user_id).first()
+
+def get_budgets(db: Session, user_id: int, skip: int = 0, limit: int = 100) -> List[Budget]:
+    return db.query(Budget).filter(Budget.user_id == user_id).offset(skip).limit(limit).all()
+
+def create_budget(db: Session, budget: BudgetCreate, user_id: int) -> Budget:
+    db_budget = Budget(**budget.model_dump(), user_id=user_id)
+    db.add(db_budget)
+    db.commit()
+    db.refresh(db_budget)
+    return db_budget
+
+def update_budget(db: Session, budget_id: int, user_id: int, budget_update: BudgetUpdate) -> Optional[Budget]:
+    db_budget = get_budget(db, budget_id, user_id)
+    if not db_budget:
+        return None
+    update_data = budget_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_budget, field, value)
+    db.commit()
+    db.refresh(db_budget)
+    return db_budget
+
+def update_spent_amount(db: Session, budget_id: int, user_id: int, amount: float) -> Optional[Budget]:
+    db_budget = get_budget(db, budget_id, user_id)
+    if not db_budget:
+        return None
+    db_budget.spent_amount += amount
+    db.commit()
+    db.refresh(db_budget)
+    return db_budget
+
+def delete_budget(db: Session, budget_id: int, user_id: int) -> bool:
+    db_budget = get_budget(db, budget_id, user_id)
+    if not db_budget:
+        return False
+    db.delete(db_budget)
+    db.commit()
+    return True
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/main.py**
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from app.database import engine, Base
+from app.routers import budgets
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="Budget Service",
+    description="Manages budget goals and spending alerts",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Instrumentator().instrument(app).expose(app)
+app.include_router(budgets.router, prefix="/api/budgets", tags=["budgets"])
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "budget-service"}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/budget-service/app/routers/budgets.py**
+```python
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from app import crud, schemas
+from app.database import get_db
+from jose import jwt, JWTError
+from app.config import settings
+
+router = APIRouter()
+
+def get_current_user_id(authorization: Optional[str] = Header(None)) -> int:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        return int(user_id)
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+@router.post("/", response_model=schemas.BudgetResponse, status_code=status.HTTP_201_CREATED)
+def create_budget(budget: schemas.BudgetCreate, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    return crud.create_budget(db, budget, user_id)
+
+@router.get("/", response_model=List[schemas.BudgetResponse])
+def list_budgets(skip: int = 0, limit: int = 100, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    budgets = crud.get_budgets(db, user_id, skip, limit)
+    result = []
+    for b in budgets:
+        b_dict = {c.name: getattr(b, c.name) for c in b.__table__.columns}
+        b_dict['usage_percentage'] = (b.spent_amount / b.limit_amount * 100) if b.limit_amount > 0 else 0
+        result.append(schemas.BudgetResponse(**b_dict))
+    return result
+
+@router.get("/{budget_id}", response_model=schemas.BudgetResponse)
+def get_budget(budget_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    budget = crud.get_budget(db, budget_id, user_id)
+    if not budget:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    b_dict = {c.name: getattr(budget, c.name) for c in budget.__table__.columns}
+    b_dict['usage_percentage'] = (budget.spent_amount / budget.limit_amount * 100) if budget.limit_amount > 0 else 0
+    return schemas.BudgetResponse(**b_dict)
+
+@router.put("/{budget_id}", response_model=schemas.BudgetResponse)
+def update_budget(budget_id: int, budget_update: schemas.BudgetUpdate, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    budget = crud.update_budget(db, budget_id, user_id, budget_update)
+    if not budget:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    b_dict = {c.name: getattr(budget, c.name) for c in budget.__table__.columns}
+    b_dict['usage_percentage'] = (budget.spent_amount / budget.limit_amount * 100) if budget.limit_amount > 0 else 0
+    return schemas.BudgetResponse(**b_dict)
+
+@router.delete("/{budget_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_budget(budget_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    if not crud.delete_budget(db, budget_id, user_id):
+        raise HTTPException(status_code=404, detail="Budget not found")
+
+@router.post("/{budget_id}/spend")
+def record_spend(budget_id: int, amount: float, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    budget = crud.update_spent_amount(db, budget_id, user_id, amount)
+    if not budget:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    usage = (budget.spent_amount / budget.limit_amount * 100) if budget.limit_amount > 0 else 0
+    alert = usage >= budget.alert_threshold
+    return {"budget_id": budget_id, "spent_amount": budget.spent_amount, "usage_percentage": usage, "alert_triggered": alert}
+```
+
+**Notification Service**
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/requirements.txt**
+```
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.4.2
+pydantic-settings==2.0.3
+redis==5.0.1
+httpx==0.25.1
+prometheus-fastapi-instrumentator==6.1.0
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+
+EXPOSE 8004
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8004"]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/.env.example**
+```
+REDIS_URL=redis://localhost:6379
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+FROM_EMAIL=noreply@financetracker.com
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/app/config.py**
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    REDIS_URL: str = "redis://redis:6379"
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    FROM_EMAIL: str = "noreply@financetracker.com"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/app/schemas.py**
+```python
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+
+class NotificationRequest(BaseModel):
+    user_id: int
+    email: Optional[str] = None
+    subject: str
+    message: str
+    notification_type: str = "info"  # info, warning, alert
+
+class BudgetAlertRequest(BaseModel):
+    user_id: int
+    email: str
+    budget_name: str
+    category: str
+    usage_percentage: float
+    limit_amount: float
+    spent_amount: float
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/app/notifications.py**
+```python
+import smtplib
+import redis
+import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from app.config import settings
+from app.schemas import NotificationRequest, BudgetAlertRequest
+import logging
+
+logger = logging.getLogger(__name__)
+
+redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    if not settings.SMTP_USER:
+        logger.info(f"Email simulation - To: {to_email}, Subject: {subject}")
+        return True
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = settings.FROM_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'html'))
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+            server.starttls()
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        return False
+
+def store_notification(user_id: int, notification: dict):
+    key = f"notifications:{user_id}"
+    redis_client.lpush(key, json.dumps(notification))
+    redis_client.ltrim(key, 0, 99)  # Keep last 100 notifications
+
+def get_user_notifications(user_id: int, limit: int = 20) -> list:
+    key = f"notifications:{user_id}"
+    notifications = redis_client.lrange(key, 0, limit - 1)
+    return [json.loads(n) for n in notifications]
+
+def send_budget_alert_email(alert: BudgetAlertRequest) -> bool:
+    subject = f"Budget Alert: {alert.budget_name} at {alert.usage_percentage:.1f}%"
+    body = f"""
+    <html><body>
+    <h2>Budget Alert - Finance Tracker</h2>
+    <p>Your budget <strong>{alert.budget_name}</strong> for category <strong>{alert.category}</strong> has reached <strong>{alert.usage_percentage:.1f}%</strong> of its limit.</p>
+    <table>
+        <tr><td>Budget Limit:</td><td>${alert.limit_amount:.2f}</td></tr>
+        <tr><td>Amount Spent:</td><td>${alert.spent_amount:.2f}</td></tr>
+        <tr><td>Remaining:</td><td>${(alert.limit_amount - alert.spent_amount):.2f}</td></tr>
+    </table>
+    <p>Please review your spending to stay within budget.</p>
+    </body></html>
+    """
+    return send_email(alert.email, subject, body)
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/notification-service/app/main.py**
+```python
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from app.schemas import NotificationRequest, BudgetAlertRequest
+from app.notifications import send_email, store_notification, get_user_notifications, send_budget_alert_email
+from datetime import datetime
+
+app = FastAPI(
+    title="Notification Service",
+    description="Handles email notifications and alerts for the finance tracker",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Instrumentator().instrument(app).expose(app)
+
+@app.post("/api/notifications/send")
+def send_notification(notification: NotificationRequest):
+    notification_record = {
+        "user_id": notification.user_id,
+        "subject": notification.subject,
+        "message": notification.message,
+        "type": notification.notification_type,
+        "timestamp": datetime.utcnow().isoformat(),
+        "read": False
+    }
+    store_notification(notification.user_id, notification_record)
+
+    if notification.email:
+        success = send_email(notification.email, notification.subject, notification.message)
+        return {"status": "sent" if success else "stored", "notification": notification_record}
+
+    return {"status": "stored", "notification": notification_record}
+
+@app.post("/api/notifications/budget-alert")
+def send_budget_alert(alert: BudgetAlertRequest):
+    success = send_budget_alert_email(alert)
+    notification_record = {
+        "user_id": alert.user_id,
+        "subject": f"Budget Alert: {alert.budget_name}",
+        "message": f"Your {alert.budget_name} budget is at {alert.usage_percentage:.1f}%",
+        "type": "alert",
+        "timestamp": datetime.utcnow().isoformat(),
+        "read": False
+    }
+    store_notification(alert.user_id, notification_record)
+    return {"status": "sent" if success else "stored", "usage_percentage": alert.usage_percentage}
+
+@app.get("/api/notifications/{user_id}")
+def get_notifications(user_id: int, limit: int = 20):
+    notifications = get_user_notifications(user_id, limit)
+    return {"user_id": user_id, "notifications": notifications, "count": len(notifications)}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "notification-service"}
+```
+
+**Analytics Service**
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/requirements.txt**
+```
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.1
+redis==5.0.1
+pydantic==2.4.2
+pydantic-settings==2.0.3
+prometheus-fastapi-instrumentator==6.1.0
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+
+EXPOSE 8005
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8005"]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/.env.example**
+```
+SECRET_KEY=your-secret-key-change-in-production
+ALGORITHM=HS256
+TRANSACTION_SERVICE_URL=http://transaction-service:8002
+BUDGET_SERVICE_URL=http://budget-service:8003
+REDIS_URL=redis://redis:6379
+CACHE_TTL_SECONDS=60
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/app/config.py**
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    SECRET_KEY: str = "your-secret-key-change-in-production"
+    ALGORITHM: str = "HS256"
+    TRANSACTION_SERVICE_URL: str = "http://transaction-service:8002"
+    BUDGET_SERVICE_URL: str = "http://budget-service:8003"
+    REDIS_URL: str = "redis://redis:6379"
+    CACHE_TTL_SECONDS: int = 60
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/app/schemas.py**
+```python
+from pydantic import BaseModel
+from typing import List, Optional
+
+class SummaryResponse(BaseModel):
+    user_id: int
+    period: str
+    total_income: float
+    total_expenses: float
+    net_balance: float
+    transaction_count: int
+
+class CategoryBreakdown(BaseModel):
+    category: str
+    total: float
+    count: int
+    percentage: float
+
+class BudgetStatusItem(BaseModel):
+    category: str
+    limit: float
+    spent: float
+    remaining: float
+    utilization_pct: float
+    exceeded: bool
+
+class MonthlyTrendItem(BaseModel):
+    month: str
+    income: float
+    expenses: float
+    net: float
+
+class CategoryBreakdownResponse(BaseModel):
+    user_id: int
+    period: str
+    breakdown: List[CategoryBreakdown]
+
+class BudgetStatusResponse(BaseModel):
+    user_id: int
+    period: str
+    items: List[BudgetStatusItem]
+
+class MonthlyTrendResponse(BaseModel):
+    user_id: int
+    trend: List[MonthlyTrendItem]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/app/main.py**
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from app.routers import analytics
+
+app = FastAPI(
+    title="Analytics Service",
+    description="Aggregates financial data to provide insights: summaries, trends, and budget status",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Instrumentator().instrument(app).expose(app)
+app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "analytics-service"}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/analytics-service/app/routers/analytics.py**
+```python
+from fastapi import APIRouter, HTTPException, Query, Header
+from typing import Optional
+import httpx
+import json
+import redis.asyncio as aioredis
+from datetime import datetime, date
+from collections import defaultdict
+
+from app.config import settings
+from app.schemas import (
+    SummaryResponse, CategoryBreakdownResponse, CategoryBreakdown,
+    BudgetStatusResponse, BudgetStatusItem, MonthlyTrendResponse, MonthlyTrendItem,
+)
+
+router = APIRouter()
+
+async def get_redis():
+    return await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+
+async def cache_get(key: str):
+    try:
+        r = await get_redis()
+        data = await r.get(key)
+        await r.aclose()
+        return json.loads(data) if data else None
+    except Exception:
+        return None
+
+async def cache_set(key: str, value: dict):
+    try:
+        r = await get_redis()
+        await r.setex(key, settings.CACHE_TTL_SECONDS, json.dumps(value))
+        await r.aclose()
+    except Exception:
+        pass
+
+async def fetch_transactions(user_id: int, authorization: str) -> list:
+    headers = {"Authorization": authorization} if authorization else {}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{settings.TRANSACTION_SERVICE_URL}/api/transactions",
+            params={"user_id": user_id},
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Failed to fetch transactions")
+        return resp.json()
+
+async def fetch_budgets(user_id: int, authorization: str) -> list:
+    headers = {"Authorization": authorization} if authorization else {}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{settings.BUDGET_SERVICE_URL}/api/budgets",
+            params={"user_id": user_id},
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Failed to fetch budgets")
+        return resp.json()
+
+def parse_txn_date(txn: dict) -> Optional[date]:
+    raw = txn.get("date") or txn.get("created_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+def filter_by_month(transactions: list, month: Optional[str]) -> list:
+    if not month:
+        return transactions
+    try:
+        year, mon = map(int, month.split("-"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+    result = []
+    for t in transactions:
+        d = parse_txn_date(t)
+        if d and d.year == year and d.month == mon:
+            result.append(t)
+    return result
+
+@router.get("/summary", response_model=SummaryResponse)
+async def get_summary(
+    user_id: int = Query(..., description="User ID"),
+    month: Optional[str] = Query(None, description="Filter by month YYYY-MM"),
+    authorization: Optional[str] = Header(None),
+):
+    cache_key = f"analytics:summary:{user_id}:{month or 'all'}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
+    transactions = await fetch_transactions(user_id, authorization or "")
+    transactions = filter_by_month(transactions, month)
+
+    income   = sum(t["amount"] for t in transactions if t.get("transaction_type") == "income")
+    expenses = sum(t["amount"] for t in transactions if t.get("transaction_type") == "expense")
+
+    result = SummaryResponse(
+        user_id=user_id,
+        period=month or "all-time",
+        total_income=round(income, 2),
+        total_expenses=round(expenses, 2),
+        net_balance=round(income - expenses, 2),
+        transaction_count=len(transactions),
+    ).model_dump()
+
+    await cache_set(cache_key, result)
+    return result
+
+@router.get("/by-category", response_model=CategoryBreakdownResponse)
+async def get_by_category(
+    user_id: int = Query(..., description="User ID"),
+    month: Optional[str] = Query(None, description="Filter by month YYYY-MM"),
+    authorization: Optional[str] = Header(None),
+):
+    cache_key = f"analytics:by-category:{user_id}:{month or 'all'}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
+    transactions = await fetch_transactions(user_id, authorization or "")
+    expenses = [t for t in filter_by_month(transactions, month) if t.get("transaction_type") == "expense"]
+
+    totals: dict[str, dict] = defaultdict(lambda: {"total": 0.0, "count": 0})
+    grand_total = sum(t["amount"] for t in expenses)
+
+    for t in expenses:
+        cat = t.get("category", "Other")
+        totals[cat]["total"] += t["amount"]
+        totals[cat]["count"] += 1
+
+    breakdown = [
+        CategoryBreakdown(
+            category=cat,
+            total=round(vals["total"], 2),
+            count=vals["count"],
+            percentage=round((vals["total"] / grand_total * 100) if grand_total else 0, 1),
+        )
+        for cat, vals in sorted(totals.items(), key=lambda x: -x[1]["total"])
+    ]
+
+    result = CategoryBreakdownResponse(
+        user_id=user_id,
+        period=month or "all-time",
+        breakdown=breakdown,
+    ).model_dump()
+
+    await cache_set(cache_key, result)
+    return result
+
+@router.get("/budget-status", response_model=BudgetStatusResponse)
+async def get_budget_status(
+    user_id: int = Query(..., description="User ID"),
+    month: Optional[str] = Query(None, description="Month YYYY-MM (defaults to current month)"),
+    authorization: Optional[str] = Header(None),
+):
+    from asyncio import gather as asyncio_gather
+    current_month = month or date.today().strftime("%Y-%m")
+    cache_key = f"analytics:budget-status:{user_id}:{current_month}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
+    transactions, budgets = await asyncio_gather(
+        fetch_transactions(user_id, authorization or ""),
+        fetch_budgets(user_id, authorization or ""),
+    )
+
+    month_expenses = [
+        t for t in filter_by_month(transactions, current_month)
+        if t.get("transaction_type") == "expense"
+    ]
+
+    spent_by_cat: dict[str, float] = defaultdict(float)
+    for t in month_expenses:
+        spent_by_cat[t.get("category", "Other")] += t["amount"]
+
+    items = []
+    for b in budgets:
+        cat   = b.get("category", "Other")
+        limit = float(b.get("monthly_limit") or b.get("limit") or 0)
+        spent = round(spent_by_cat.get(cat, 0.0), 2)
+        util  = round((spent / limit * 100) if limit else 0, 1)
+        items.append(BudgetStatusItem(
+            category=cat,
+            limit=limit,
+            spent=spent,
+            remaining=round(limit - spent, 2),
+            utilization_pct=util,
+            exceeded=spent > limit,
+        ))
+
+    result = BudgetStatusResponse(
+        user_id=user_id,
+        period=current_month,
+        items=items,
+    ).model_dump()
+
+    await cache_set(cache_key, result)
+    return result
+
+@router.get("/monthly-trend", response_model=MonthlyTrendResponse)
+async def get_monthly_trend(
+    user_id: int = Query(..., description="User ID"),
+    months: int = Query(6, ge=1, le=24, description="Number of past months to include"),
+    authorization: Optional[str] = Header(None),
+):
+    from asyncio import gather as asyncio_gather
+    cache_key = f"analytics:monthly-trend:{user_id}:{months}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
+    transactions = await fetch_transactions(user_id, authorization or "")
+
+    monthly: dict[str, dict] = defaultdict(lambda: {"income": 0.0, "expenses": 0.0})
+    for t in transactions:
+        d = parse_txn_date(t)
+        if not d:
+            continue
+        key = d.strftime("%Y-%m")
+        if t.get("transaction_type") == "income":
+            monthly[key]["income"] += t["amount"]
+        elif t.get("transaction_type") == "expense":
+            monthly[key]["expenses"] += t["amount"]
+
+    trend = [
+        MonthlyTrendItem(
+            month=k,
+            income=round(v["income"], 2),
+            expenses=round(v["expenses"], 2),
+            net=round(v["income"] - v["expenses"], 2),
+        )
+        for k, v in sorted(monthly.items())[-months:]
+    ]
+
+    result = MonthlyTrendResponse(user_id=user_id, trend=trend).model_dump()
+    await cache_set(cache_key, result)
+    return result
+```
+
+**API Gateway**
+
+**D:/Cloud-Native Personal Finance Tracker/services/api-gateway/package.json**
+```json
+{
+  "name": "api-gateway",
+  "version": "1.0.0",
+  "description": "API Gateway for Personal Finance Tracker",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "express-rate-limit": "^7.1.5",
+    "dotenv": "^16.3.1",
+    "prom-client": "^15.1.0",
+    "winston": "^3.11.0",
+    "express-winston": "^4.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "jest": "^29.7.0"
+  }
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/api-gateway/Dockerfile**
+```dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install --only=production
+
+COPY src/ ./src/
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
+CMD ["node", "src/index.js"]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/api-gateway/.env.example**
+```
+PORT=3000
+USER_SERVICE_URL=http://user-service:8001
+TRANSACTION_SERVICE_URL=http://transaction-service:8002
+BUDGET_SERVICE_URL=http://budget-service:8003
+NOTIFICATION_SERVICE_URL=http://notification-service:8004
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:80
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/api-gateway/src/index.js**
+```javascript
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const client = require('prom-client');
+const routes = require('./routes/proxy');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Prometheus metrics
+const collectDefaultMetrics = client.collectDefaultMetrics;
+collectDefaultMetrics({ timeout: 5000 });
+
+const httpRequestDuration = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+});
+
+// Security middleware
+app.use(helmet());
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+  credentials: true,
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: { error: 'Too many requests, please try again later' },
+});
+app.use('/api/', limiter);
+
+// Logging
+app.use(morgan('combined'));
+
+// Request timing middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    httpRequestDuration.observe({ method: req.method, route: req.path, status_code: res.statusCode }, duration);
+  });
+  next();
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: 'api-gateway', timestamp: new Date().toISOString() });
+});
+
+// Metrics endpoint
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+// API routes (proxy)
+app.use('/api', routes);
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+app.listen(PORT, () => {
+  console.log(`API Gateway running on port ${PORT}`);
+});
+
+module.exports = app;
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/api-gateway/src/routes/proxy.js**
+```javascript
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const router = express.Router();
+
+const USER_SERVICE_URL = process.env.USER_SERVICE_URL || 'http://user-service:8001';
+const TRANSACTION_SERVICE_URL = process.env.TRANSACTION_SERVICE_URL || 'http://transaction-service:8002';
+const BUDGET_SERVICE_URL = process.env.BUDGET_SERVICE_URL || 'http://budget-service:8003';
+const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://notification-service:8004';
+const ANALYTICS_SERVICE_URL = process.env.ANALYTICS_SERVICE_URL || 'http://analytics-service:8005';
+
+const proxyOptions = (target) => ({
+  target,
+  changeOrigin: true,
+  on: {
+    error: (err, req, res) => {
+      console.error(`Proxy error: ${err.message}`);
+      res.status(503).json({ error: 'Service temporarily unavailable', details: err.message });
+    },
+    proxyReq: (proxyReq, req) => {
+      console.log(`Proxying ${req.method} ${req.url} -> ${target}`);
+    },
+  },
+});
+
+// User Service routes
+router.use('/users', createProxyMiddleware(proxyOptions(USER_SERVICE_URL)));
+
+// Transaction Service routes
+router.use('/transactions', createProxyMiddleware(proxyOptions(TRANSACTION_SERVICE_URL)));
+
+// Budget Service routes
+router.use('/budgets', createProxyMiddleware(proxyOptions(BUDGET_SERVICE_URL)));
+
+// Notification Service routes
+router.use('/notifications', createProxyMiddleware(proxyOptions(NOTIFICATION_SERVICE_URL)));
+
+// Analytics Service routes
+router.use('/analytics', createProxyMiddleware(proxyOptions(ANALYTICS_SERVICE_URL)));
+
+module.exports = router;
+```
+
+**Frontend**
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/package.json**
+```json
+{
+  "name": "finance-tracker-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext js,jsx"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.21.0",
+    "axios": "^1.6.2",
+    "recharts": "^2.10.1",
+    "@headlessui/react": "^1.7.17",
+    "@heroicons/react": "^2.1.1",
+    "react-hot-toast": "^2.4.1",
+    "date-fns": "^3.0.6",
+    "clsx": "^2.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "vite": "^5.0.8",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.4.0",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0"
+  }
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/Dockerfile**
+```dockerfile
+# Build stage
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN npm run build
+
+# Production stage
+FROM nginx:alpine
+
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget -qO- http://localhost/health || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/index.html**
+```html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Finance Tracker</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/vite.config.js**
+```javascript
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
+      },
+    },
+  },
+});
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/tailwind.config.js**
+```javascript
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        primary: {
+          50: '#eff6ff',
+          500: '#3b82f6',
+          600: '#2563eb',
+          700: '#1d4ed8',
+        },
+      },
+    },
+  },
+  plugins: [],
+};
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/postcss.config.js**
+```javascript
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/nginx.conf**
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+    gzip_min_length 1000;
+
+    # SPA routing
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Proxy API requests
+    location /api {
+        proxy_pass http://api-gateway:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    # Health check
+    location /health {
+        return 200 'healthy';
+        add_header Content-Type text/plain;
+    }
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/main.jsx**
+```javascript
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App.jsx';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/index.css**
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition-colors font-medium;
+  }
+  .btn-secondary {
+    @apply bg-gray-200 text-gray-800 px-4 py-2 rounded-lg hover:bg-gray-300 transition-colors font-medium;
+  }
+  .card {
+    @apply bg-white rounded-xl shadow-sm border border-gray-100 p-6;
+  }
+  .input {
+    @apply w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent;
+  }
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/App.jsx**
+```javascript
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import Layout from './components/Layout';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import DashboardPage from './pages/DashboardPage';
+import TransactionsPage from './pages/TransactionsPage';
+import BudgetsPage from './pages/BudgetsPage';
+
+function PrivateRoute({ children }) {
+  const { user, loading } = useAuth();
+  if (loading) return <div className="flex items-center justify-center h-screen"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div></div>;
+  return user ? children : <Navigate to="/login" />;
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <Toaster position="top-right" />
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
+            <Route index element={<Navigate to="/dashboard" />} />
+            <Route path="dashboard" element={<DashboardPage />} />
+            <Route path="transactions" element={<TransactionsPage />} />
+            <Route path="budgets" element={<BudgetsPage />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/services/api.js**
+```javascript
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: '',
+  headers: { 'Content-Type': 'application/json' },
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('token');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/context/AuthContext.jsx**
+```javascript
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import api from '../services/api';
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      api.get('/api/users/me')
+        .then(res => setUser(res.data))
+        .catch(() => {
+          localStorage.removeItem('token');
+          delete api.defaults.headers.common['Authorization'];
+        })
+        .finally(() => setLoading(false));
+    } else {
+      setLoading(false);
+    }
+  }, []);
+
+  const login = async (username, password) => {
+    const res = await api.post('/api/users/login', { username, password });
+    const { access_token } = res.data;
+    localStorage.setItem('token', access_token);
+    api.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;
+    const userRes = await api.get('/api/users/me');
+    setUser(userRes.data);
+    return userRes.data;
+  };
+
+  const logout = () => {
+    localStorage.removeItem('token');
+    delete api.defaults.headers.common['Authorization'];
+    setUser(null);
+  };
+
+  const register = async (userData) => {
+    const res = await api.post('/api/users/register', userData);
+    return res.data;
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, loading, login, logout, register }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/components/Layout.jsx**
+```javascript
+import React, { useState } from 'react';
+import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import {
+  HomeIcon, CreditCardIcon, ChartBarIcon,
+  ArrowRightOnRectangleIcon, Bars3Icon, XMarkIcon
+} from '@heroicons/react/24/outline';
+
+const navItems = [
+  { path: '/dashboard', label: 'Dashboard', icon: HomeIcon },
+  { path: '/transactions', label: 'Transactions', icon: CreditCardIcon },
+  { path: '/budgets', label: 'Budgets', icon: ChartBarIcon },
+];
+
+export default function Layout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const handleLogout = () => {
+    logout();
+    navigate('/login');
+  };
+
+  return (
+    <div className="flex h-screen bg-gray-50">
+      {/* Sidebar */}
+      <aside className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} fixed inset-y-0 left-0 z-50 w-64 bg-white shadow-lg transition-transform lg:translate-x-0 lg:static lg:inset-0`}>
+        <div className="flex h-full flex-col">
+          <div className="flex items-center justify-between px-6 py-4 border-b">
+            <h1 className="text-xl font-bold text-primary-600">Finance Tracker</h1>
+            <button className="lg:hidden" onClick={() => setSidebarOpen(false)}>
+              <XMarkIcon className="h-6 w-6" />
+            </button>
+          </div>
+          <nav className="flex-1 px-4 py-6 space-y-1">
+            {navItems.map(({ path, label, icon: Icon }) => (
+              <NavLink key={path} to={path}
+                className={({ isActive }) =>
+                  `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${isActive ? 'bg-primary-50 text-primary-600' : 'text-gray-600 hover:bg-gray-100'}`
+                }
+              >
+                <Icon className="h-5 w-5" />
+                {label}
+              </NavLink>
+            ))}
+          </nav>
+          <div className="px-4 py-4 border-t">
+            <div className="flex items-center gap-3 px-3 py-2 mb-2">
+              <div className="h-8 w-8 rounded-full bg-primary-600 flex items-center justify-center text-white text-sm font-bold">
+                {user?.username?.[0]?.toUpperCase()}
+              </div>
+              <div>
+                <p className="text-sm font-medium">{user?.username}</p>
+                <p className="text-xs text-gray-500">{user?.email}</p>
+              </div>
+            </div>
+            <button onClick={handleLogout} className="flex items-center gap-2 w-full px-3 py-2 text-sm text-red-600 hover:bg-red-50 rounded-lg">
+              <ArrowRightOnRectangleIcon className="h-4 w-4" />
+              Logout
+            </button>
+          </div>
+        </div>
+      </aside>
+      {/* Main */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <header className="bg-white border-b px-6 py-4 flex items-center gap-4 lg:hidden">
+          <button onClick={() => setSidebarOpen(true)}>
+            <Bars3Icon className="h-6 w-6" />
+          </button>
+          <h1 className="text-lg font-bold text-primary-600">Finance Tracker</h1>
+        </header>
+        <main className="flex-1 overflow-y-auto p-6">
+          <Outlet />
+        </main>
+      </div>
+      {sidebarOpen && <div className="fixed inset-0 z-40 bg-black bg-opacity-50 lg:hidden" onClick={() => setSidebarOpen(false)} />}
+    </div>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/pages/LoginPage.jsx**
+```javascript
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+export default function LoginPage() {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const { login } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      await login(username, password);
+      navigate('/dashboard');
+      toast.success('Welcome back!');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Login failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary-50 to-blue-100">
+      <div className="card w-full max-w-md">
+        <h2 className="text-2xl font-bold text-center mb-6">Welcome Back</h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Username</label>
+            <input type="text" className="input" value={username} onChange={e => setUsername(e.target.value)} required />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Password</label>
+            <input type="password" className="input" value={password} onChange={e => setPassword(e.target.value)} required />
+          </div>
+          <button type="submit" disabled={loading} className="btn-primary w-full">
+            {loading ? 'Signing in...' : 'Sign In'}
+          </button>
+        </form>
+        <p className="text-center text-sm text-gray-600 mt-4">
+          Don't have an account? <Link to="/register" className="text-primary-600 font-medium">Sign up</Link>
+        </p>
+      </div>
+    </div>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/pages/RegisterPage.jsx**
+```javascript
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+export default function RegisterPage() {
+  const [form, setForm] = useState({ email: '', username: '', full_name: '', password: '' });
+  const [loading, setLoading] = useState(false);
+  const { register, login } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      await register(form);
+      await login(form.username, form.password);
+      navigate('/dashboard');
+      toast.success('Account created successfully!');
+    } catch (err) {
+      const detail = err.response?.data?.detail;
+      const msg = Array.isArray(detail) ? detail[0]?.msg : (typeof detail === 'string' ? detail : 'Registration failed');
+      toast.error(msg || 'Registration failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary-50 to-blue-100">
+      <div className="card w-full max-w-md">
+        <h2 className="text-2xl font-bold text-center mb-6">Create Account</h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {[
+            { key: 'full_name', label: 'Full Name', type: 'text' },
+            { key: 'username', label: 'Username', type: 'text' },
+            { key: 'email', label: 'Email', type: 'email' },
+            { key: 'password', label: 'Password', type: 'password' },
+          ].map(({ key, label, type }) => (
+            <div key={key}>
+              <label className="block text-sm font-medium mb-1">{label}</label>
+              <input type={type} className="input" value={form[key]} onChange={e => setForm({...form, [key]: e.target.value})} required />
+            </div>
+          ))}
+          <button type="submit" disabled={loading} className="btn-primary w-full">
+            {loading ? 'Creating account...' : 'Create Account'}
+          </button>
+        </form>
+        <p className="text-center text-sm text-gray-600 mt-4">
+          Already have an account? <Link to="/login" className="text-primary-600 font-medium">Sign in</Link>
+        </p>
+      </div>
+    </div>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/pages/DashboardPage.jsx**
+```javascript
+import React, { useState, useEffect } from 'react';
+import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import api from '../services/api';
+import toast from 'react-hot-toast';
+
+const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
+
+function StatCard({ title, value, subtitle, color = 'primary' }) {
+  const colorMap = { primary: 'text-primary-600', green: 'text-green-600', red: 'text-red-600', yellow: 'text-yellow-600' };
+  return (
+    <div className="card">
+      <p className="text-sm text-gray-500 mb-1">{title}</p>
+      <p className={`text-2xl font-bold ${colorMap[color]}`}>{value}</p>
+      {subtitle && <p className="text-xs text-gray-400 mt-1">{subtitle}</p>}
+    </div>
+  );
+}
+
+export default function DashboardPage() {
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.get('/api/transactions/summary')
+      .then(res => setSummary(res.data))
+      .catch(() => toast.error('Failed to load summary'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div className="flex items-center justify-center h-64"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div></div>;
+
+  const categoryData = summary?.categories ? Object.entries(summary.categories).map(([name, value]) => ({ name, value: Math.abs(value) })) : [];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold">Dashboard</h1>
+        <p className="text-gray-500">Your financial overview</p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard title="Total Income" value={`$${summary?.total_income?.toFixed(2) || '0.00'}`} color="green" />
+        <StatCard title="Total Expenses" value={`$${summary?.total_expenses?.toFixed(2) || '0.00'}`} color="red" />
+        <StatCard title="Net Balance" value={`$${summary?.net_balance?.toFixed(2) || '0.00'}`} color={summary?.net_balance >= 0 ? 'green' : 'red'} />
+        <StatCard title="Transactions" value={summary?.transaction_count || 0} subtitle="Total recorded" />
+      </div>
+      {categoryData.length > 0 && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="card">
+            <h3 className="font-semibold mb-4">Spending by Category</h3>
+            <ResponsiveContainer width="100%" height={280}>
+              <PieChart>
+                <Pie data={categoryData} cx="50%" cy="50%" outerRadius={100} dataKey="value" label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}>
+                  {categoryData.map((_, index) => <Cell key={index} fill={COLORS[index % COLORS.length]} />)}
+                </Pie>
+                <Tooltip formatter={(v) => `$${v.toFixed(2)}`} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="card">
+            <h3 className="font-semibold mb-4">Category Breakdown</h3>
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={categoryData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                <YAxis tick={{ fontSize: 12 }} />
+                <Tooltip formatter={(v) => `$${v.toFixed(2)}`} />
+                <Bar dataKey="value" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+      {categoryData.length === 0 && (
+        <div className="card text-center py-12">
+          <p className="text-gray-400 text-lg">No transactions yet</p>
+          <p className="text-gray-300 text-sm mt-2">Start by adding your first transaction</p>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/pages/TransactionsPage.jsx**
+```javascript
+import React, { useState, useEffect } from 'react';
+import api from '../services/api';
+import toast from 'react-hot-toast';
+import { format } from 'date-fns';
+import { PlusIcon, TrashIcon } from '@heroicons/react/24/outline';
+
+const CATEGORIES = ['Food', 'Housing', 'Transportation', 'Healthcare', 'Entertainment', 'Education', 'Shopping', 'Utilities', 'Salary', 'Freelance', 'Investment', 'Other'];
+
+function TransactionModal({ onClose, onSave }) {
+  const [form, setForm] = useState({ amount: '', transaction_type: 'expense', category: 'Food', description: '' });
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      await api.post('/api/transactions/', { ...form, amount: parseFloat(form.amount) });
+      toast.success('Transaction added!');
+      onSave();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to add transaction');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+      <div className="card w-full max-w-md">
+        <h3 className="text-lg font-semibold mb-4">Add Transaction</h3>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Type</label>
+            <select className="input" value={form.transaction_type} onChange={e => setForm({...form, transaction_type: e.target.value})}>
+              <option value="expense">Expense</option>
+              <option value="income">Income</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Amount</label>
+            <input type="number" step="0.01" min="0" className="input" value={form.amount} onChange={e => setForm({...form, amount: e.target.value})} required />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Category</label>
+            <select className="input" value={form.category} onChange={e => setForm({...form, category: e.target.value})}>
+              {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Description</label>
+            <input type="text" className="input" value={form.description} onChange={e => setForm({...form, description: e.target.value})} />
+          </div>
+          <div className="flex gap-3">
+            <button type="button" className="btn-secondary flex-1" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={loading} className="btn-primary flex-1">{loading ? 'Saving...' : 'Save'}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export default function TransactionsPage() {
+  const [transactions, setTransactions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+
+  const fetchTransactions = () => {
+    setLoading(true);
+    api.get('/api/transactions/')
+      .then(res => setTransactions(res.data))
+      .catch(() => toast.error('Failed to load transactions'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { fetchTransactions(); }, []);
+
+  const handleDelete = async (id) => {
+    if (!confirm('Delete this transaction?')) return;
+    try {
+      await api.delete(`/api/transactions/${id}`);
+      toast.success('Transaction deleted');
+      fetchTransactions();
+    } catch {
+      toast.error('Failed to delete');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Transactions</h1>
+          <p className="text-gray-500">Track your income and expenses</p>
+        </div>
+        <button className="btn-primary flex items-center gap-2" onClick={() => setShowModal(true)}>
+          <PlusIcon className="h-4 w-4" /> Add Transaction
+        </button>
+      </div>
+      <div className="card overflow-hidden p-0">
+        {loading ? (
+          <div className="flex items-center justify-center h-32"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary-600"></div></div>
+        ) : transactions.length === 0 ? (
+          <div className="text-center py-12 text-gray-400">No transactions yet</div>
+        ) : (
+          <table className="w-full">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                {['Date', 'Category', 'Description', 'Type', 'Amount', ''].map(h => (
+                  <th key={h} className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {transactions.map(t => (
+                <tr key={t.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3 text-sm text-gray-500">{format(new Date(t.date), 'MMM dd, yyyy')}</td>
+                  <td className="px-4 py-3 text-sm font-medium">{t.category}</td>
+                  <td className="px-4 py-3 text-sm text-gray-600">{t.description || '-'}</td>
+                  <td className="px-4 py-3">
+                    <span className={`inline-flex px-2 py-1 rounded-full text-xs font-medium ${t.transaction_type === 'income' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                      {t.transaction_type}
+                    </span>
+                  </td>
+                  <td className={`px-4 py-3 text-sm font-bold ${t.transaction_type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
+                    {t.transaction_type === 'income' ? '+' : '-'}${t.amount.toFixed(2)}
+                  </td>
+                  <td className="px-4 py-3">
+                    <button onClick={() => handleDelete(t.id)} className="text-red-400 hover:text-red-600">
+                      <TrashIcon className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {showModal && <TransactionModal onClose={() => setShowModal(false)} onSave={() => { setShowModal(false); fetchTransactions(); }} />}
+    </div>
+  );
+}
+```
+
+**D:/Cloud-Native Personal Finance Tracker/services/frontend/src/pages/BudgetsPage.jsx**
+```javascript
+import React, { useState, useEffect } from 'react';
+import api from '../services/api';
+import toast from 'react-hot-toast';
+import { PlusIcon, TrashIcon } from '@heroicons/react/24/outline';
+
+const CATEGORIES = ['Food', 'Housing', 'Transportation', 'Healthcare', 'Entertainment', 'Education', 'Shopping', 'Utilities', 'Other'];
+
+function BudgetCard({ budget, onDelete }) {
+  const usage = budget.usage_percentage || 0;
+  const color = usage >= 100 ? 'bg-red-500' : usage >= 80 ? 'bg-yellow-500' : 'bg-green-500';
+
+  return (
+    <div className="card">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <h3 className="font-semibold">{budget.name}</h3>
+          <p className="text-sm text-gray-500">{budget.category} · {budget.period}</p>
+        </div>
+        <button onClick={() => onDelete(budget.id)} className="text-red-400 hover:text-red-600">
+          <TrashIcon className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="space-y-2">
+        <div className="flex justify-between text-sm">
+          <span className="text-gray-600">${budget.spent_amount?.toFixed(2)} spent</span>
+          <span className="font-medium">${budget.limit_amount?.toFixed(2)} limit</span>
+        </div>
+        <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+          <div className={`h-full ${color} transition-all`} style={{ width: `${Math.min(usage, 100)}%` }} />
+        </div>
+        <p className={`text-xs font-medium ${usage >= 100 ? 'text-red-600' : usage >= 80 ? 'text-yellow-600' : 'text-green-600'}`}>
+          {usage.toFixed(1)}% used
+          {usage >= budget.alert_threshold && usage < 100 && ' · Alert threshold reached'}
+          {usage >= 100 && ' · Budget exceeded!'}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function BudgetModal({ onClose, onSave }) {
+  const [form, setForm] = useState({ name: '', category: 'Food', limit_amount: '', period: 'monthly', alert_threshold: 80 });
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      await api.post('/api/budgets/', { ...form, limit_amount: parseFloat(form.limit_amount), alert_threshold: parseFloat(form.alert_threshold) });
+      toast.success('Budget created!');
+      onSave();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to create budget');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+      <div className="card w-full max-w-md">
+        <h3 className="text-lg font-semibold mb-4">Create Budget</h3>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Budget Name</label>
+            <input type="text" className="input" value={form.name} onChange={e => setForm({...form, name: e.target.value})} required />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Category</label>
+            <select className="input" value={form.category} onChange={e => setForm({...form, category: e.target.value})}>
+              {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+            </select>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Limit Amount ($)</label>
+              <input type="number" step="0.01" min="0" className="input" value={form.limit_amount} onChange={e => setForm({...form, limit_amount: e.target.value})} required />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Period</label>
+              <select className="input" value={form.period} onChange={e => setForm({...form, period: e.target.value})}>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="yearly">Yearly</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Alert Threshold (%)</label>
+            <input type="number" min="0" max="100" className="input" value={form.alert_threshold} onChange={e => setForm({...form, alert_threshold: e.target.value})} />
+          </div>
+          <div className="flex gap-3">
+            <button type="button" className="btn-secondary flex-1" onClick={onClose}>Cancel</button>
+            <button type="submit" disabled={loading} className="btn-primary flex-1">{loading ? 'Creating...' : 'Create'}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export default function BudgetsPage() {
+  const [budgets, setBudgets] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+
+  const fetchBudgets = () => {
+    setLoading(true);
+    api.get('/api/budgets/')
+      .then(res => setBudgets(res.data))
+      .catch(() => toast.error('Failed to load budgets'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { fetchBudgets(); }, []);
+
+  const handleDelete = async (id) => {
+    if (!confirm('Delete this budget?')) return;
+    try {
+      await api.delete(`/api/budgets/${id}`);
+      toast.success('Budget deleted');
+      fetchBudgets();
+    } catch {
+      toast.error('Failed to delete');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Budgets</h1>
+          <p className="text-gray-500">Manage your spending goals</p>
+        </div>
+        <button className="btn-primary flex items-center gap-2" onClick={() => setShowModal(true)}>
+          <PlusIcon className="h-4 w-4" /> Add Budget
+        </button>
+      </div>
+      {loading ? (
+        <div className="flex items-center justify-center h-32"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary-600"></div></div>
+      ) : budgets.length === 0 ? (
+        <div className="card text-center py-12 text-gray-400">No budgets yet. Create your first budget to start tracking!</div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {budgets.map(b => <BudgetCard key={b.id} budget={b} onDelete={handleDelete} />)}
+        </div>
+      )}
+      {showModal && <BudgetModal onClose={() => setShowModal(false)} onSave={() => { setShowModal(false); fetchBudgets(); }} />}
+    </div>
+  );
+}
+```
+
+---
+
+**Summary: Complete project includes 6 Python microservices, 1 Node.js API gateway, 1 React frontend, comprehensive K8s manifests with Helm, Terraform modules for AWS/Azure infrastructure, Ansible playbooks for node setup, GitHub Actions CI/CD pipelines, Prometheus/Grafana monitoring, and Docker Compose for local development.**

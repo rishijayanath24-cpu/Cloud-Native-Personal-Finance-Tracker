@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: notification-service
-          image: finance-tracker/notification-service:latest
+          image: rishi636363/finance-tracker-notification-service:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8004
